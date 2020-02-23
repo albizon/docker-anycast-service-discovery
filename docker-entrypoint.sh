@@ -59,6 +59,48 @@ ports() {
 	docker inspect $1 | jq -r '.[0].NetworkSettings.Ports | map(select(. != null)) | map(.[].HostPort) | join(",")'
 }
 
+#IPV6
+
+add_interface_v6() {
+	IFACE=$1
+	ADDR=$2
+	echo Adding $IFACE with ipv6 address $ADDR
+	ip tuntap add dev $IFACE mode tap
+	ip link set dev $IFACE mtu 1418
+	ip -6 addr add $ADDR dev $IFACE
+}
+
+
+remove_interface_v6() {
+	ip tuntap del dev $1 mode tap
+}
+
+
+open_firewall_v6() {
+	iptables -${3:-A} INPUT -p tcp -d $1 -m multiport --dports $2 -j ACCEPT 2>/dev/null
+}
+
+
+close_firewall_v6() {
+	open_firewall_v6 $1 $2 D
+}
+
+
+advertise_v6() {
+	ip link set dev $1 ${2:-up}
+}
+
+
+disable_advertisement_v6() {
+	advertise_v6 $1 down
+}
+
+
+ports_v6() {
+	# converts exposed ports from docker metadata to a comma-separated list of ports for iptables
+	docker inspect $1 | jq -r '.[0].NetworkSettings.Ports | map(select(. != null)) | map(.[].HostPort) | join(",")'
+}
+
 
 trap 'trap - SIGTERM && kill 0' SIGINT SIGTERM EXIT
 
@@ -117,6 +159,72 @@ do
 		"destroy")
 			echo $FROM destroyed, removing $IFACE
 			remove_interface $IFACE
+			;;
+		exec_*)
+			# ignore exec_create, exec_start, and exec_die.
+			# They're noisy due to frequent health checks.
+			;;
+		*)
+			echo unhandled: $STATUS on $ID
+	esac
+done
+
+#IPV6
+
+# recreate interfaces after reboot
+docker container ls --all --quiet --filter 'label=anycast.addressv6' | while read ID
+do
+	IFACE=any-${ID:0:10}
+	INSPECT=$(docker inspect $ID)
+	ADDR=$(echo "$INSPECT" | jq -r '.[0].Config.Labels["anycast.addressv6"]')
+	HEALTH=$(echo "$INSPECT" | jq -r '.[0].State.Health.Status')
+	add_interface_v6 $IFACE $ADDR
+	if [ "$HEALTH" = "healthy" ]
+	then
+		open_firewall_v6 $ADDR $(ports $ID)
+		advertise_v6 $IFACE
+	else
+		docker restart $ID &
+	fi
+done
+
+
+# wait for events
+docker events --filter 'label=anycast.addressv6' --filter 'type=container' --format '{{json .}}' | while read event
+do
+	STATUS=$(echo "$event" | jq -r '.status')
+	ID=$(echo "$event" | jq -r '.id')
+	FROM=$(echo "$event" | jq -r '.from')
+	ADDR=$(echo "$event" | jq -r '.Actor.Attributes["anycast.addressv6"]')
+	#SERVICE=$(echo "$event" | jq -r '.Actor.Attributes["com.docker.compose.service"]')
+	# Linux maximum interface name length is 15 characters
+	IFACE=any-${ID:0:10}
+	case "$STATUS" in
+		"create")
+			echo $FROM created
+			add_interface_v6 $IFACE $ADDR
+			;;
+		"start")
+			echo $FROM started
+			# nothing to do until it's healthy
+			;;
+		"health_status: healthy")
+			echo $FROM became healthy
+			open_firewall_v6 $ADDR $(ports $ID)
+			advertise_v6 $IFACE
+			;;
+		"health_status: unhealthy")
+			echo $FROM unhealthy, pulling advertisement
+			disable_advertisement_v6 $IFACE
+			;;
+		"die"|"kill"|"stop")
+			echo $FROM stopped, pulling advertisement
+			disable_advertisement_v6 $IFACE
+			close_firewall_v6 $ADDR $(ports $ID)
+			;;
+		"destroy")
+			echo $FROM destroyed, removing $IFACE
+			remove_interface_v6 $IFACE
 			;;
 		exec_*)
 			# ignore exec_create, exec_start, and exec_die.
